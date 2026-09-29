@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         Auto xử lý phiếu sự cố
 // @namespace    ghn-ticket-bot
-// @version      3.8.0
+// @version      3.13.1
 // @description  Tự động xử lý phiếu sự cố GHN: Quá hạn toàn trình / Không giao-lấy-trả đúng số lần / COD không tích giao thành công. Không gọi API, không cần nhập token — tra cứu ưu tiên khung ẩn (không hiện tab), dự phòng 1 tab nền dùng chung cho cả lượt chạy.
 // @match        https://noibo.ghn.vn/*
 // @match        https://tracuunoibo.ghn.vn/*
+// @match        https://nhanh.ghn.vn/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_addValueChangeListener
@@ -12,8 +13,9 @@
 // @grant        GM_openInTab
 // @grant        GM_info
 // @run-at       document-idle
-// @updateURL    https://raw.githubusercontent.com/MyTran1806/Clear-Task/main/ghn-ticket-bot.user.js
-// @downloadURL  https://raw.githubusercontent.com/MyTran1806/Clear-Task/main/ghn-ticket-bot.user.js
+// ==== TỰ CẬP NHẬT: bỏ 2 dấu // ở đầu 2 dòng dưới và thay bằng link file .user.js thật sau khi đã đưa file lên nơi chung ====
+// // @updateURL    https://THAY-BANG-LINK-FILE/ghn-ticket-bot.user.js
+// // @downloadURL  https://THAY-BANG-LINK-FILE/ghn-ticket-bot.user.js
 // ==/UserScript==
 
 (function () {
@@ -80,6 +82,15 @@
       const leaves = Array.from(document.querySelectorAll('*')).filter((e) => e.children.length === 0);
       const i = leaves.indexOf(el);
       return leaves[i + 1] ? leaves[i + 1].textContent.trim() : '';
+    };
+    // Lấy chữ của ô cách nhãn `label` `offset` ô (theo thứ tự các ô lá trên trang) — dùng để
+    // đọc thêm nhãn trạng thái ("Đã thu"/"Chưa thu") nằm ngay sau giá trị tiền.
+    const leafAfter = (label, offset) => {
+      const el = leafByText(label);
+      if (!el) return '';
+      const leaves = Array.from(document.querySelectorAll('*')).filter((e) => e.children.length === 0);
+      const i = leaves.indexOf(el);
+      return leaves[i + offset] ? leaves[i + offset].textContent.trim() : '';
     };
     // Đọc tab "Lịch sử đơn hàng": mỗi log = 1 dòng (giờ, thao tác, chi tiết, kho, người
     // thao tác), gom theo tiêu đề ngày. Giờ hiển thị là giờ Việt Nam (UTC+7).
@@ -170,7 +181,20 @@
       if (!hasDigit(valueOfLabel('Phí khai giá:'))) return null;
       const totalText = valueOfLabel('Tổng phí dịch vụ:');
       const khaiGiaText = valueOfLabel('Phí khai giá:');
-      return { total: parseMoney(totalText), khaiGia: parseMoney(khaiGiaText), totalText, khaiGiaText };
+      // "Giao thất bại - thu tiền": ô giá trị rồi tới nhãn trạng thái "Đã thu"/"Chưa thu" ngay
+      // sau đó (2 ô lá kể từ nhãn). Không có dòng này ở đơn → gtbCollected = null.
+      const gtbLabel = 'Giao thất bại - thu tiền:';
+      let gtbCollected = null;
+      let gtbStatusText = '';
+      if (leafByText(gtbLabel)) {
+        gtbStatusText = leafAfter(gtbLabel, 2);
+        if (/đã thu/i.test(gtbStatusText)) gtbCollected = true;
+        else if (/chưa thu/i.test(gtbStatusText)) gtbCollected = false;
+      }
+      return {
+        total: parseMoney(totalText), khaiGia: parseMoney(khaiGiaText), totalText, khaiGiaText,
+        gtbCollected, gtbStatusText,
+      };
     };
 
     async function doLookup(code, opts) {
@@ -184,7 +208,7 @@
         const vh = valueOf('Trạng thái vận hành');
         // Chỉ nhận kết quả khi trang đã hiện ĐÚNG mã đơn cần tra (tránh đọc nhầm dữ liệu cũ).
         if (vh && nextLeafText('Mã đơn hàng') === code) {
-          result = { ok: true, vh, kh: valueOf('Trạng thái khách hàng'), lc: valueOf('Trạng thái luân chuyển') };
+          result = { ok: true, vh, kh: valueOf('Trạng thái khách hàng'), lc: valueOf('Trạng thái luân chuyển'), khoGiao: valueOf('Kho giao') };
           break;
         }
         await sleep(300);
@@ -248,11 +272,183 @@
     })();
     return;
   }
+  // ======================================================================
+  // Phần 1b: chạy trên nhanh.ghn.vn (Lastmile) — CHỈ khi được bot mở làm "tab nền Lastmile"
+  // (?worker=1&rsid=...). Nhận yêu cầu {mã đơn, ID BC giao} → chọn đúng BC ở góc phải, tìm đơn
+  // ở ô "Nhập mã ĐH", đọc "Số tiền đã thu khi giao thất bại", rồi báo lại. Mở 1 lần cho cả lượt chạy, tự đóng khi xong.
+  // ======================================================================
+  if (location.hostname === 'nhanh.ghn.vn') {
+    let navUrl = location.href;
+    try { navUrl = performance.getEntriesByType('navigation')[0].name || navUrl; } catch (e) {}
+    const qp = new URLSearchParams((navUrl.split('?')[1] || '').split('#')[0]);
+    // Trang Lastmile tự chuyển /lastmile → /lastmile/trip-list (mất tham số) và TẢI LẠI mỗi khi đổi
+    // BC, nên mã lượt chạy được nhớ trong sessionStorage (sống qua các lần tải lại của tab này).
+    let lmRsid = qp.get('worker') === '1' ? qp.get('rsid') || '' : null;
+    try {
+      if (lmRsid !== null) sessionStorage.setItem('ghnbot_lm_rsid', lmRsid);
+      else lmRsid = sessionStorage.getItem('ghnbot_lm_rsid');
+    } catch (e) {}
+    if (lmRsid === null) return;
+    // BC đang chọn được lưu ở localStorage (CURRENT_HUB, dùng chung mọi tab Lastmile) → nhớ lại
+    // BC gốc của người dùng để trả về khi xong, khỏi làm lệch công việc Lastmile của họ.
+    const hubKey = 'lm_orig_hub_' + lmRsid;
+    try {
+      if (GM_getValue(hubKey, null) === null) GM_setValue(hubKey, localStorage.getItem('CURRENT_HUB') || '');
+    } catch (e) {}
+
+    const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    const until = async (fn, ms) => {
+      const t0 = Date.now();
+      for (;;) {
+        let v = null;
+        try { v = fn(); } catch (e) {}
+        if (v) return v;
+        if (Date.now() - t0 > ms) return null;
+        await sleep(250);
+      }
+    };
+    const setVal = (el, v) => {
+      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, v);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    };
+    const parseMoney = (t) => {
+      const m = String(t || '').match(/\d[\d.,]*/);
+      if (!m) return null;
+      const n = parseInt(m[0].replace(/[.,]/g, ''), 10);
+      return Number.isNaN(n) ? null : n;
+    };
+    const norm = (t) => String(t || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const leafIn = (root, text) =>
+      Array.from(root.querySelectorAll('*')).find((e) => e.children.length === 0 && norm(e.textContent) === norm(text)) || null;
+    const valueAfter = (el) => {
+      for (let e = el, i = 0; e && i < 4; e = e.parentElement, i++) {
+        if (e.nextElementSibling) return e.nextElementSibling.textContent.trim();
+      }
+      return '';
+    };
+
+    // Ô chọn BC = ô .ant-select nằm sát mép trên, ngoài cùng bên phải.
+    const bcSelect = () => {
+      const sels = Array.from(document.querySelectorAll('.ant-select')).filter((s) => vis(s) && s.getBoundingClientRect().top < 160);
+      sels.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
+      return sels[0] || null;
+    };
+    const ensureBc = async (bc) => {
+      const sel = await until(bcSelect, 40000);
+      if (!sel) throw new Error('Lastmile: không thấy ô chọn BC ở góc phải (đã đăng nhập nhanh.ghn.vn chưa?)');
+      const cur = () => norm((sel.querySelector('.ant-select-content') || sel.querySelector('.ant-select-selection-item') || {}).textContent);
+      if (cur().startsWith(bc)) return;
+      const input = sel.querySelector('input');
+      if (!input) throw new Error('Lastmile: ô chọn BC không có ô nhập để gõ ID');
+      sel.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      input.focus();
+      setVal(input, bc);
+      const opt = await until(
+        () => Array.from(document.querySelectorAll('.ant-select-item-option')).filter(vis).find((o) => norm(o.textContent).startsWith(bc)),
+        10000
+      );
+      if (!opt) throw new Error('Lastmile: không có BC "' + bc + '" trong danh sách chọn');
+      opt.click();
+      // Chọn BC làm trang TẢI LẠI → script này sẽ chết ở đây, bản chạy sau khi tải lại (BC đã
+      // đúng) tự làm tiếp yêu cầu đang chờ. Nếu không tải lại thì đợi ô chọn đổi.
+      const ok = await until(() => cur().startsWith(bc), 15000);
+      if (!ok) throw new Error('Lastmile: đã chọn BC "' + bc + '" nhưng ô chọn chưa đổi');
+      await sleep(1500);
+    };
+
+    const closeModals = async () => {
+      for (let i = 0; i < 3; i++) {
+        const m = Array.from(document.querySelectorAll('.ant-modal')).find(vis);
+        if (!m) return;
+        const closeBtn =
+          Array.from(m.querySelectorAll('button')).find((b) => norm(b.textContent) === 'đóng') || m.querySelector('.ant-modal-close');
+        if (closeBtn) closeBtn.click();
+        await sleep(600);
+      }
+    };
+
+    const searchInput = () => Array.from(document.querySelectorAll('input')).find((i) => vis(i) && /nhập mã đh/i.test(i.placeholder || ''));
+    const findSearchButton = (input) => {
+      for (let e = input.parentElement, i = 0; e && i < 5; e = e.parentElement, i++) {
+        const b = e.querySelector('button');
+        if (b && vis(b)) return b;
+      }
+      return null;
+    };
+    const doLm = async (code, bc) => {
+      await ensureBc(bc);
+      await closeModals();
+      const input = await until(searchInput, 20000);
+      if (!input) throw new Error('Lastmile: không thấy ô "Nhập mã ĐH"');
+      input.focus();
+      setVal(input, code);
+      await sleep(300);
+      const findModal = () => Array.from(document.querySelectorAll('.ant-modal')).filter(vis).find((m) => m.textContent.includes(code));
+      const btn = findSearchButton(input);
+      if (btn) btn.click();
+      let modal = await until(findModal, 12000);
+      if (!modal) {
+        for (const type of ['keydown', 'keypress', 'keyup']) {
+          input.dispatchEvent(new KeyboardEvent(type, { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+        }
+        modal = await until(findModal, 12000);
+      }
+      if (!modal) throw new Error('Lastmile: tìm mã đơn ' + code + ' không ra bảng đơn hàng (có thể chọn sai BC ' + bc + ')');
+
+      // Số tiền đã thu khi giao thất bại
+      // (Lúc mới mở bảng ô này ghi "Đang lấy dữ liệu..." → phải chờ tới khi có số.)
+      const lab = await until(() => leafIn(modal, 'Số tiền đã thu khi giao thất bại'), 8000);
+      if (!lab) throw new Error('Lastmile: không thấy dòng "Số tiền đã thu khi giao thất bại" của đơn ' + code);
+      const amountText = await until(() => {
+        const l = leafIn(modal, 'Số tiền đã thu khi giao thất bại');
+        const v = l ? valueAfter(l) : '';
+        return /\d/.test(v) ? v : null;
+      }, 20000);
+      const amount = parseMoney(amountText);
+      if (amount == null) throw new Error('Lastmile: dòng "Số tiền đã thu khi giao thất bại" của đơn ' + code + ' chưa hiện số sau 20 giây');
+
+      await closeModals();
+      return { ok: true, amount, amountText, bc };
+    };
+
+    (async () => {
+      let lastReqT = 0;
+      let idleSince = Date.now();
+      for (;;) {
+        GM_setValue('lm_worker_alive_at', Date.now());
+        GM_setValue('lm_worker_rsid', lmRsid);
+        if (String(GM_getValue('run_session_id', '') || '') !== lmRsid) break; // lượt chạy đã đổi/kết thúc
+        const req = GM_getValue('lm_request', null);
+        if (req && req.rsid === lmRsid && req.t > lastReqT) {
+          lastReqT = req.t;
+          idleSince = Date.now();
+          let out;
+          try { out = await doLm(req.code, req.bc); } catch (e) { out = { ok: false, error: String((e && e.message) || e) }; }
+          out.t = Date.now();
+          GM_setValue('lm_result_' + req.code, out);
+        } else if (Date.now() - idleSince > 120000) {
+          break;
+        }
+        await sleep(400);
+      }
+      // Kết thúc: trả BC về như ban đầu của người dùng, xoá dấu "tab nền" rồi tự đóng.
+      try {
+        const orig = GM_getValue(hubKey, '');
+        if (orig) localStorage.setItem('CURRENT_HUB', orig);
+        GM_setValue(hubKey, null);
+      } catch (e) {}
+      try { sessionStorage.removeItem('ghnbot_lm_rsid'); } catch (e) {}
+      try { window.close(); } catch (e) {}
+    })();
+    return;
+  }
   if (location.hostname !== 'noibo.ghn.vn') return;
   if (window.top !== window.self) return; // trang noibo nằm trong khung khác thì bỏ qua
 
   const ORIGIN = 'https://noibo.ghn.vn';
   const HOST_ID = 'ghn-ticket-bot-host';
+  const TRIGGER_ID = 'ghn-ticket-bot-trigger';
   const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '?';
 
   // ======================================================================
@@ -340,7 +536,7 @@
   // được thì mới dự phòng mở tab riêng cho đơn đó. Trang tra cứu (Phần 1 ở trên) đọc kết quả
   // hiển thị và báo lại qua bộ nhớ chung. KHÔNG gọi API, KHÔNG token.
   // ======================================================================
-  async function waitForLookupResult(key, openedAt, timeoutMs, fatalOnTimeout) {
+  async function waitForLookupResult(key, openedAt, timeoutMs, fatalOnTimeout, errMsg) {
     let got = null;
     let listenerId = null;
     try { listenerId = GM_addValueChangeListener(key, (name, oldV, newV) => { if (newV && newV.t >= openedAt) got = newV; }); } catch (e) {}
@@ -358,7 +554,7 @@
       if (listenerId != null) { try { GM_removeValueChangeListener(listenerId); } catch (e) {} }
     }
     const err = new Error(
-      'Không nhận được kết quả từ trang tra cứu — kiểm tra đã đăng nhập https://tracuunoibo.ghn.vn (cùng trình duyệt) chưa.'
+      errMsg || 'Không nhận được kết quả từ trang tra cứu — kiểm tra đã đăng nhập https://tracuunoibo.ghn.vn (cùng trình duyệt) chưa.'
     );
     err.timeout = true;
     err.fatal = !!fatalOnTimeout; // lỗi hệ thống: dừng cả lượt chạy thay vì lặp lại ở từng phiếu
@@ -434,6 +630,39 @@
     } finally {
       try { if (tab) tab.close(); } catch (e) {}
     }
+  }
+
+  // ---- Lastmile (nhanh.ghn.vn): 1 tab nền dùng chung cho cả lượt chạy (xem Phần 1b) ----
+  const lmWorkerUrl = (rsid) => 'https://nhanh.ghn.vn/lastmile?worker=1&rsid=' + encodeURIComponent(rsid);
+  async function ensureLmWorker(rsid) {
+    const isAlive = () => sget('lm_worker_rsid', null) === rsid && Date.now() - sget('lm_worker_alive_at', 0) < 8000;
+    if (isAlive()) return;
+    log('  Đang mở tab nền Lastmile (chỉ chờ 1 lần đầu lượt chạy)...');
+    GM_openInTab(lmWorkerUrl(rsid), { active: false, insert: true });
+    const t0 = Date.now();
+    while (Date.now() - t0 < 60000) {
+      if (isAlive()) return;
+      await sleep(300);
+    }
+    const err = new Error('Không mở được tab nền Lastmile — kiểm tra đã đăng nhập https://nhanh.ghn.vn (cùng trình duyệt) và đã cho Tampermonkey chạy trên trang này chưa.');
+    err.fatal = true;
+    throw err;
+  }
+  // Hỏi Lastmile: số tiền đã thu khi giao thất bại của 1 đơn, sau khi chọn đúng BC giao (bcId) ở góc phải.
+  async function lookupLastmile(code, bcId) {
+    const rsid = sget('run_session_id', null);
+    if (!rsid) throw new Error('Chưa có lượt chạy đang hoạt động');
+    await ensureLmWorker(rsid);
+    const key = 'lm_result_' + code;
+    const openedAt = Date.now();
+    GM_setValue(key, null);
+    GM_setValue('lm_request', { code, bc: bcId, rsid, t: Date.now() });
+    const r = await waitForLookupResult(
+      key, openedAt, 120000, true,
+      'Lastmile không trả kết quả cho đơn ' + code + ' — kiểm tra tab nền Lastmile (đã đăng nhập chưa, có đúng BC ' + bcId + ' không).'
+    );
+    if (!r.ok) throw new Error(r.error || 'Tra cứu Lastmile thất bại');
+    return r; // { ok, amount, amountText, bc }
   }
 
   async function lookupOrder(orderCode, opts) {
@@ -631,8 +860,12 @@
     const vh = normText(o.vh);
     const status = vh === OPS_DELIVERED ? 'delivered' : vh === OPS_RETURNED ? 'returned' : 'other';
     log(`  ${code}: Vận hành: ${o.vh || '?'} | Khách hàng: ${o.kh || '?'} → ${status}`);
-    if (o.fee) log(`  ${code}: Tổng phí dịch vụ ${o.fee.totalText} − Phí khai giá ${o.fee.khaiGiaText} = ${fmtMoney(o.fee.total - o.fee.khaiGia)}`);
-    return { code, status, opsName: o.vh || '', vh: o.vh || '', history: o.history || null, fee: o.fee || null };
+    if (o.fee) {
+      log(`  ${code}: Tổng phí dịch vụ ${o.fee.totalText} − Phí khai giá ${o.fee.khaiGiaText} = ${fmtMoney(o.fee.total - o.fee.khaiGia)}`);
+      log(`  ${code}: Giao thất bại - thu tiền: ${o.fee.gtbStatusText || '(không có dòng này)'}`);
+    }
+    const m = String(o.khoGiao || '').match(/^\s*(\d{4,})/);
+    return { code, status, opsName: o.vh || '', vh: o.vh || '', history: o.history || null, fee: o.fee || null, bcGiao: m ? m[1] : '' };
   }
 
   // "10:34 27/08/2026" (giờ Việt Nam) -> mốc thời gian (ms), null nếu không đọc được
@@ -745,7 +978,7 @@
     const explainSt = rule.key === 'SAI_SO_LAN' ? getTicketExplainStatus() : null;
     const needFee = explainSt === 'overdue';
     for (const c of codes) orders.push(await fetchOrderStatus(c, needHist, needFee));
-    const detail = orders.map((o) => `${o.code}: ${o.status}${o.opsName ? ' (' + o.opsName + ')' : ''}`).join('; ');
+    let detail = orders.map((o) => `${o.code}: ${o.status}${o.opsName ? ' (' + o.opsName + ')' : ''}`).join('; ');
 
     const concludeWith = async (note, why) => {
       if (dry) {
@@ -782,24 +1015,44 @@
     if (rule.key === 'SAI_SO_LAN' && orders.every((o) => isReturnGroupVh(o.vh))) {
       log(`[${ticketCode}] Đơn ở trạng thái hoàn — trạng thái giải trình: ${explainSt}`);
       if (explainSt === 'overdue') {
-        // Tổng cước đền bù = Σ (Tổng phí dịch vụ − Phí khai giá) của các đơn trong phiếu.
-        let amount = 0;
+        // Có "phiếu thu GTB TT" hay không: xem CẢ tracuu lẫn Lastmile (2 hệ thống có lúc chưa đồng
+        // bộ) — KHÔNG có khi cả 2 đều không có; CÓ khi tracuu HOẶC Lastmile báo đã thu.
         for (const o of orders) {
-          if (!o.fee || o.fee.total == null || o.fee.khaiGia == null) {
-            throw new Error(`Không đọc được cước của đơn ${o.code} để điền vào comment`);
+          const tcCollected = !!(o.fee && o.fee.gtbCollected === true);
+          if (!tcCollected && !o.bcGiao) throw new Error(`Không đọc được ID BC giao ("Kho giao") của đơn ${o.code} ở tracuu để chọn BC trên Lastmile`);
+          // tracuu đã báo "Đã thu" thì chắc chắn CÓ phiếu thu → khỏi mở Lastmile cho đơn này.
+          o.lm = tcCollected ? null : await lookupLastmile(o.code, o.bcGiao);
+          o.hasGtb = tcCollected || o.lm.amount > 0;
+          log(
+            `  ${o.code}: GTB TT — tracuu: ${o.fee && o.fee.gtbStatusText ? o.fee.gtbStatusText : 'không có'} | Lastmile: ${o.lm ? o.lm.amountText : '(không cần tra)'}` +
+              ` → ${o.hasGtb ? 'CÓ phiếu thu' : 'KHÔNG có phiếu thu'}`
+          );
+        }
+        const withGtb = orders.filter((o) => o.hasGtb);
+        if (withGtb.length === 0) {
+          // KHÔNG có phiếu thu GTB TT → comment + đổi người xử lý
+          // Tổng cước đền bù = Σ (Tổng phí dịch vụ − Phí khai giá) của các đơn trong phiếu.
+          let amount = 0;
+          for (const o of orders) {
+            if (!o.fee || o.fee.total == null || o.fee.khaiGia == null) {
+              throw new Error(`Không đọc được cước của đơn ${o.code} để điền vào comment`);
+            }
+            amount += o.fee.total - o.fee.khaiGia;
           }
-          amount += o.fee.total - o.fee.khaiGia;
+          if (!(amount > 0)) throw new Error(`Tổng cước đền bù tính ra ${amount} (không hợp lệ) — cần kiểm tra tay`);
+          const comment = overdueComment(amount);
+          const what = `Comment SLA (đền bù ${fmtMoney(amount)}) + chuyển người xử lý sang ${REASSIGN_ID} - ${REASSIGN_NAME}`;
+          if (dry) {
+            log(`[${ticketCode}] (XEM TRƯỚC) Sẽ: ${what}`);
+            return { ...base, kind: 'planned', result: `(Xem trước) Sẽ: ${what}`, detail };
+          }
+          await commentAndReassign(comment, REASSIGN_ID, REASSIGN_NAME);
+          log(`[${ticketCode}] ĐÃ: ${what}`);
+          return { ...base, kind: 'reassigned', result: `Đã: ${what}`, detail };
         }
-        if (!(amount > 0)) throw new Error(`Tổng cước đền bù tính ra ${amount} (không hợp lệ) — cần kiểm tra tay`);
-        const comment = overdueComment(amount);
-        const what = `Comment SLA (đền bù ${fmtMoney(amount)}) + chuyển người xử lý sang ${REASSIGN_ID} - ${REASSIGN_NAME}`;
-        if (dry) {
-          log(`[${ticketCode}] (XEM TRƯỚC) Sẽ: ${what}`);
-          return { ...base, kind: 'planned', result: `(Xem trước) Sẽ: ${what}`, detail };
-        }
-        await commentAndReassign(comment, REASSIGN_ID, REASSIGN_NAME);
-        log(`[${ticketCode}] ĐÃ: ${what}`);
-        return { ...base, kind: 'reassigned', result: `Đã: ${what}`, detail };
+        // CÓ phiếu thu GTB TT (tracuu hoặc Lastmile) → CS theo dõi (rơi xuống kết quả mặc định bên dưới)
+        detail += ` | có phiếu thu GTB TT (${withGtb.map((o) => o.code).join(', ')})`;
+        log(`[${ticketCode}] Có phiếu thu GTB TT (${withGtb.map((o) => o.code).join(', ')}) → CS theo dõi.`);
       }
     }
 
@@ -1058,13 +1311,73 @@
     if (old) old.remove();
     ui = null;
   }
+  function unmountTrigger() {
+    const old = document.getElementById(TRIGGER_ID);
+    if (old) old.remove();
+  }
 
+  // Nút bấm để mở/đóng panel — mặc định KHÔNG tự xổ panel đầy đủ ra mỗi khi tải trang, tránh
+  // gây rối cho CS khi chỉ đang xem phiếu bình thường (không dùng tool). Ở trang danh sách,
+  // chèn thẳng vào cạnh nút "Xử lý phiếu CSKH", giao diện giống 1 nút bình thường của trang.
+  // Không tìm thấy chỗ đó (VD trang chi tiết phiếu) thì dùng nút tròn nổi góc phải thay thế.
+  function findCskhButton() {
+    return Array.from(document.querySelectorAll('button, a')).find((el) => el.textContent.trim() === 'Xử lý phiếu CSKH') || null;
+  }
+  async function toggleCollapsed(mode) {
+    const collapsed = !sget('panel_collapsed', true);
+    await sset('panel_collapsed', collapsed);
+    if (collapsed) unmountPanel();
+    else mountPanel(mode);
+  }
+  function mountTrigger(mode) {
+    unmountTrigger();
+    const host = document.createElement('div');
+    host.id = TRIGGER_ID;
+    const cskhBtn = findCskhButton();
+    if (cskhBtn && cskhBtn.parentElement) {
+      host.dataset.placement = 'inline';
+      host.style.cssText = 'all:initial;display:inline-flex;vertical-align:middle;';
+      const root = host.attachShadow({ mode: 'open' });
+      root.innerHTML = `
+        <style>
+          .btn{display:inline-flex;align-items:center;background:#fff;color:#333;
+            border:1px solid #d9d9d9;border-radius:6px;padding:8px 16px;cursor:pointer;
+            white-space:nowrap;user-select:none}
+          .btn:hover{border-color:#f04e23;color:#f04e23}
+        </style>
+        <div class="btn" id="btn" title="Mở/đóng Ticket Bot">Ticket Bot</div>`;
+      // Lấy đúng font (cỡ chữ/độ đậm/font family) của nút "Xử lý phiếu CSKH" để chữ bằng nhau.
+      root.getElementById('btn').style.font = getComputedStyle(cskhBtn).font;
+      cskhBtn.parentElement.insertBefore(host, cskhBtn);
+      root.getElementById('btn').addEventListener('click', () => toggleCollapsed(mode));
+    } else {
+      host.dataset.placement = 'fallback';
+      host.style.cssText = 'all:initial;position:fixed;top:80px;right:16px;z-index:2147483647;';
+      const root = host.attachShadow({ mode: 'open' });
+      root.innerHTML = `
+        <style>
+          .fab{background:#f04e23;color:#fff;padding:8px 14px;border-radius:999px;
+            font:13px -apple-system,Segoe UI,Roboto,sans-serif;font-weight:600;cursor:pointer;
+            box-shadow:0 4px 14px rgba(0,0,0,.25);white-space:nowrap;user-select:none}
+          .fab:hover{filter:brightness(1.05)}
+        </style>
+        <div class="fab" id="fab" title="Mở/đóng Ticket Bot">🎫 Ticket Bot</div>`;
+      document.documentElement.appendChild(host);
+      root.getElementById('fab').addEventListener('click', () => toggleCollapsed(mode));
+    }
+  }
+
+  // Panel đầy đủ (view đã lưu, nút Bắt đầu/Dừng, log...) — chỉ gắn khi đang mở (xem nút bấm ở
+  // trên). Trạng thái đóng/mở được nhớ lại (GM storage) nên panel đang mở sẽ giữ nguyên mở qua
+  // các lần tải trang khi bot đang tự chạy xuyên qua nhiều phiếu.
   function mountPanel(mode) {
     unmountPanel();
     const host = document.createElement('div');
     host.id = HOST_ID;
     host.style.cssText = 'all:initial;position:fixed;top:80px;right:16px;z-index:2147483647;';
     const root = host.attachShadow({ mode: 'open' });
+    document.documentElement.appendChild(host);
+
     root.innerHTML = `
       <style>
         .panel{width:360px;max-height:82vh;background:#fff;border:1px solid #ddd;border-radius:10px;
@@ -1090,7 +1403,7 @@
           white-space:pre-wrap;font:11px Consolas,monospace}
       </style>
       <div class="panel">
-        <div class="hd"><span>GHN Ticket Bot v${VERSION} ${mode === 'detail' ? '(đang ở phiếu)' : '(danh sách)'}</span><span class="min" id="min">—</span></div>
+        <div class="hd"><span>Ticket Bot v${VERSION} ${mode === 'detail' ? '(đang ở phiếu)' : '(danh sách)'}</span><span class="min" id="min" title="Thu gọn thành icon">—</span></div>
         <div class="bd" id="bd">
           <div class="views">
             <div class="sec">View đã lưu</div>
@@ -1112,16 +1425,12 @@
           <div class="log" id="log"></div>
         </div>
       </div>`;
-    document.documentElement.appendChild(host);
 
     ui = { host, root, logEl: root.getElementById('log') };
     root.getElementById('dry').checked = !!sget('run_dry', true);
     renderViewSelect();
 
-    root.getElementById('min').addEventListener('click', () => {
-      const bd = root.getElementById('bd');
-      bd.style.display = bd.style.display === 'none' ? 'block' : 'none';
-    });
+    root.getElementById('min').addEventListener('click', () => toggleCollapsed(mode));
 
     root.getElementById('viewsel').addEventListener('change', async (e) => {
       const v = getViews()[parseInt(e.target.value, 10)];
@@ -1198,10 +1507,29 @@
   }
   function tick() {
     const mode = getMode();
-    if (mode !== currentMode || (mode && !document.getElementById(HOST_ID))) {
-      currentMode = mode;
-      if (mode) mountPanel(mode);
-      else unmountPanel();
+    currentMode = mode;
+    if (mode) {
+      // Nút bấm chỉ hiện ở trang danh sách — trang chi tiết phiếu thì KHÔNG hiện (CS mở từng
+      // phiếu để xử lý bình thường không nên bị icon này làm phiền). Panel đầy đủ (nếu đang mở
+      // từ trước, VD đang theo dõi 1 lượt chạy) vẫn hiện xuyên suốt cả 2 trang như cũ.
+      if (mode === 'list') {
+        // Trang SPA hay vẽ lại toolbar → kiểm tra mỗi giây, gắn lại nếu bị rớt khỏi trang. Nếu
+        // đang ở dạng nổi dự phòng (lúc gắn nút chưa kịp thấy "Xử lý phiếu CSKH") mà giờ nút đó
+        // đã xuất hiện thì nâng cấp lại thành nút chèn cạnh nó luôn, khỏi kẹt mãi ở dạng nổi.
+        const trig = document.getElementById(TRIGGER_ID);
+        const needRemount =
+          !trig || !document.body.contains(trig) || (trig.dataset.placement === 'fallback' && findCskhButton());
+        if (needRemount) mountTrigger(mode);
+      } else {
+        unmountTrigger();
+      }
+      const collapsed = sget('panel_collapsed', true);
+      const panelEl = document.getElementById(HOST_ID);
+      if (!collapsed && !panelEl) mountPanel(mode);
+      if (collapsed && panelEl) unmountPanel();
+    } else {
+      unmountTrigger();
+      unmountPanel();
     }
     if (mode === 'detail' && resumedFor !== location.pathname) {
       resumedFor = location.pathname;
