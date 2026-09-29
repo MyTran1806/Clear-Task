@@ -13,9 +13,8 @@
 // @grant        GM_openInTab
 // @grant        GM_info
 // @run-at       document-idle
-// ==== TỰ CẬP NHẬT: bỏ 2 dấu // ở đầu 2 dòng dưới và thay bằng link file .user.js thật sau khi đã đưa file lên nơi chung ====
-// // @updateURL    https://THAY-BANG-LINK-FILE/ghn-ticket-bot.user.js
-// // @downloadURL  https://THAY-BANG-LINK-FILE/ghn-ticket-bot.user.js
+// @updateURL    https://raw.githubusercontent.com/MyTran1806/Clear-Task/main/ghn-ticket-bot.user.js
+// @downloadURL  https://raw.githubusercontent.com/MyTran1806/Clear-Task/main/ghn-ticket-bot.user.js
 // ==/UserScript==
 
 (function () {
